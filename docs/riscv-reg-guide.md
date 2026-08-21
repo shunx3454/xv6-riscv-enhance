@@ -10,6 +10,8 @@
 - [`kernel/trap.c`](../kernel/trap.c)：trap、系统调用、中断、page fault 处理。
 - [`kernel/trampoline.S`](../kernel/trampoline.S)：用户态/内核态切换时保存寄存器和切换页表。
 - [`kernel/vm.c`](../kernel/vm.c)：写 `satp` 启用 Sv39 页表。
+- [`kernel/plic.c`](../kernel/plic.c)：PLIC 外部中断控制器初始化、claim、complete。
+- [`kernel/memlayout.h`](../kernel/memlayout.h)：QEMU `virt` 平台上的 PLIC、CLINT、UART、virtio MMIO 地址。
 
 ## 1. RISC-V 寄存器宏观分类
 
@@ -77,7 +79,206 @@ QEMU
   -> U-mode /init 和 sh
 ```
 
-## 3. 通用寄存器 GPR
+## 3. 不同模式下寄存器的同一性
+
+讨论“不同模式下的同一个寄存器是否相同”时，要先区分两类寄存器：
+
+```text
+普通架构寄存器，例如 x0-x31、FPR、Vector
+控制状态寄存器 CSR，例如 mepc/sepc、mstatus/sstatus、satp
+```
+
+结论是：
+
+```text
+普通计算寄存器基本是跨模式同一组；
+CSR 大多按特权级分层，不是简单的同一组；
+少数状态 CSR 之间存在字段级视图或关联。
+```
+
+### 3.1 GPR 是同一组
+
+RISC-V 的通用寄存器：
+
+```text
+x0-x31
+ra/sp/gp/tp/t0/a0/s0/...
+```
+
+在 U-mode、S-mode、M-mode 下是同一组架构寄存器。也就是说：
+
+```text
+U-mode 的 a0
+S-mode 的 a0
+M-mode 的 a0
+```
+
+本质上都是 `x10`，不是每个模式各有一份。
+
+因此 trap 发生时，如果内核想保留用户态的 `a0`、`sp`、`ra` 等值，必须由软件保存。RISC-V 硬件不会自动给每个模式准备一套 GPR，也不会自动保存所有 GPR。
+
+xv6 在 [`kernel/trampoline.S`](../kernel/trampoline.S) 中手动保存用户寄存器：
+
+```asm
+sd ra, 40(a0)
+sd sp, 48(a0)
+...
+sd a7, 168(a0)
+```
+
+这正是因为用户态和内核态共用同一组 GPR。进入内核后，内核代码会继续使用这些寄存器，如果不先保存，用户上下文就会被破坏。
+
+### 3.2 `sp` 不是每个模式独立
+
+`sp` 是 `x2`，也属于 GPR，所以不同模式下不是各有一份。
+
+但是操作系统会在模式切换时主动切换栈：
+
+```text
+用户态运行时：
+  sp 指向用户栈
+
+trap 进入内核后：
+  trampoline 保存用户 sp
+  再把 sp 改成当前进程的内核栈
+```
+
+xv6 在 `trampoline.S` 中保存用户 `sp` 到 trapframe，之后加载内核栈：
+
+```asm
+sd sp, 48(a0)
+...
+ld sp, 8(a0)
+```
+
+所以应区分：
+
+```text
+硬件寄存器 sp 只有一份；
+用户栈和内核栈是两块不同内存；
+OS 通过保存/恢复 sp 在两块栈之间切换。
+```
+
+### 3.3 `tp` 在 xv6 中也不是每模式一份
+
+`tp` 是 `x4`，也是同一组 GPR。
+
+xv6 启动时把 hart id 写入 `tp`：
+
+```c
+int id = r_mhartid();
+w_tp(id);
+```
+
+内核后续用 `tp` 实现 `cpuid()`。但用户程序也可能使用或修改 `tp`。因此 xv6 在用户态 trap 进入内核时保存用户 `tp`，并重新加载内核需要的 hart id：
+
+```asm
+sd tp, 64(a0)      # 保存用户 tp
+ld tp, 32(a0)      # 加载 kernel_hartid 到 tp
+```
+
+这说明 `tp` 并不是 U-mode 一份、S-mode 一份；只是 xv6 在不同上下文中约定了不同用途。
+
+### 3.4 PC 是一份执行状态，但返回地址 CSR 分层
+
+PC 不是普通 GPR，但它也是当前 hart 的执行状态，不是 U/S/M 各一套。
+
+trap 发生时，硬件会把当前 PC 保存到对应的 exception program counter：
+
+```text
+进入 M-mode trap -> mepc
+进入 S-mode trap -> sepc
+```
+
+之后 PC 被设置为 trap vector，例如 `mtvec` 或 `stvec` 指向的地址。返回时：
+
+```text
+mret 从 mepc 恢复 PC
+sret 从 sepc 恢复 PC
+```
+
+所以：
+
+```text
+PC 本身不是每个模式独立一份；
+但不同特权级有不同的返回地址 CSR，例如 mepc、sepc。
+```
+
+### 3.5 CSR 大多不是同一组
+
+CSR 和 GPR 不同。很多 CSR 按特权级分层，有不同名字和不同用途：
+
+```text
+mstatus / sstatus / ustatus
+mepc    / sepc    / uepc
+mcause  / scause  / ucause
+mtval   / stval   / utval
+mtvec   / stvec   / utvec
+mie     / sie     / uie
+mip     / sip     / uip
+```
+
+这些通常不能简单理解成“同一个寄存器在不同模式下的别名”。例如：
+
+```text
+mepc 和 sepc 是两个不同 CSR
+mcause 和 scause 是两个不同 CSR
+mtvec 和 stvec 是两个不同 CSR
+mscratch 和 sscratch 是两个不同 CSR
+```
+
+M-mode trap 使用 `mepc/mcause/mtval/mtvec`；S-mode trap 使用 `sepc/scause/stval/stvec`。S-mode 写 `sepc` 不等价于写 `mepc`，S-mode 设置 `stvec` 也不会影响 `mtvec`。
+
+### 3.6 部分 CSR 是受限视图或字段级关联
+
+有些 S-level CSR 可以看作 M-level CSR 中相关字段的受限视图，最典型的是：
+
+```text
+sstatus  和 mstatus
+sie      和 mie
+sip      和 mip
+```
+
+更准确地说：
+
+```text
+sstatus 暴露 mstatus 中和 S/U mode 相关的字段
+sie     暴露 mie 中 supervisor interrupt enable 相关位
+sip     暴露 mip 中 supervisor interrupt pending 相关位
+```
+
+所以这些寄存器之间不是完全无关的两份状态，但也不能简单说“同一个寄存器”。它们是字段级关联或受限视图。
+
+### 3.7 同一性总结
+
+```text
+类型                         不同模式是否同一份
+GPR x0-x31                   是，同一组
+sp/ra/a0/tp 等 ABI 寄存器     是，本质都是 x 寄存器
+PC                           当前执行状态一份，但 trap 保存到不同 epc
+FPR f0-f31                   是，同一组，若启用
+Vector v0-v31                是，同一组，若实现
+mepc/sepc/uepc               否，不同 CSR
+mcause/scause/ucause         否，不同 CSR
+mtvec/stvec/utvec            否，不同 CSR
+mscratch/sscratch/uscratch   否，不同 CSR
+mstatus/sstatus/ustatus      不是简单同一份，存在字段级视图/关联
+mie/sie/uie                  存在字段级关联
+mip/sip/uip                  存在字段级关联
+satp                         S-level CSR，不是 U/M 各一份
+```
+
+一句话概括：
+
+```text
+计算用的寄存器，例如 x0-x31，是跨模式同一组；
+控制系统行为的 CSR，大多按特权级分层，不是同一个；
+少数状态 CSR 之间存在字段级映射或受限视图关系。
+```
+
+这也是为什么 xv6 进入内核时必须手动保存用户寄存器：用户态和内核态没有自动隔离的一套 GPR。
+
+## 4. 通用寄存器 GPR
 
 RISC-V 有 32 个通用寄存器：
 
@@ -142,7 +343,7 @@ a0     系统调用返回值
 - [`user/usys.pl`](../user/usys.pl) 生成用户态 syscall stub，把系统调用号放到 `a7`，执行 `ecall`。
 - [`kernel/syscall.c`](../kernel/syscall.c) 从 `p->trapframe->a7` 取系统调用号，从 `a0-a5` 取参数。
 
-## 4. PC：程序计数器
+## 5. PC：程序计数器
 
 PC 不是普通 GPR，不能像 `x1`、`x2` 那样用普通指令直接读写，但它是处理器核心执行状态。
 
@@ -170,7 +371,7 @@ p->trapframe->epc += 4;
 
 `epc += 4` 是为了跳过 `ecall` 指令。如果不加，返回用户态后会再次执行同一条 `ecall`，导致系统调用无限重复。
 
-## 5. 浮点寄存器 FPR
+## 6. 浮点寄存器 FPR
 
 如果处理器实现 `F/D` 扩展，会有：
 
@@ -195,7 +396,7 @@ fcsr
 - OS 可以利用 `FS` 状态做 lazy FPU save/restore。
 - xv6 教学内核通常避免使用浮点，简化上下文切换。
 
-## 6. 向量寄存器
+## 7. 向量寄存器
 
 如果实现 RISC-V `V` 扩展，会有：
 
@@ -219,7 +420,7 @@ vcsr
 | S-mode | 如果实现 V | 条件允许 | OS 控制保存恢复 |
 | M-mode | 如果实现 V | 条件允许 | 最高权限控制 |
 
-## 7. CSR 总览
+## 8. CSR 总览
 
 CSR 是 Control and Status Registers，即控制状态寄存器。它们负责控制特权级、中断、异常、页表、计数器、物理内存保护等。
 
@@ -246,7 +447,7 @@ h*  Hypervisor-level CSR，可选
 - 某些 CSR 的低权限访问受 `mcounteren`、`scounteren` 等控制。
 - 某些 CSR 是可选扩展提供的，具体处理器不一定实现。
 
-## 8. Machine-level CSR
+## 9. Machine-level CSR
 
 Machine-level CSR 只能由 M-mode 直接访问。xv6 主要在 [`kernel/start.c`](../kernel/start.c) 中使用它们完成启动过渡。
 
@@ -396,7 +597,7 @@ w_pmpcfg0(0xf);
 
 含义：允许 S-mode 访问物理内存。如果 PMP 没配好，进入 S-mode 后可能无法访问 RAM 或 MMIO 设备。
 
-## 9. Supervisor-level CSR
+## 10. Supervisor-level CSR
 
 Supervisor-level CSR 由 S-mode 内核主要使用，M-mode 也可访问，U-mode 不能直接访问。
 
@@ -624,7 +825,242 @@ w_stimecmp(r_time() + 1000000);
 
 在 [`kernel/trap.c`](../kernel/trap.c) 的 `clockintr()` 中，时钟中断处理完会设置下一次中断。
 
-## 10. User-level CSR
+## 11. PLIC、CLINT 与 SSTC
+
+PLIC、CLINT、SSTC 都和 RISC-V 平台中断有关，但它们不是同一层面的东西：
+
+```text
+PLIC   Platform-Level Interrupt Controller，平台级外部中断控制器
+CLINT  Core-Local Interruptor，核心本地中断控制器
+SSTC   Supervisor-mode Timer Compare，S-mode timer compare 扩展
+```
+
+在 QEMU `virt` 机器上，相关 MMIO 地址写在 [`kernel/memlayout.h`](../kernel/memlayout.h)：
+
+```text
+0x02000000  CLINT
+0x0c000000  PLIC
+0x10000000  UART0
+0x10001000  virtio disk
+```
+
+本项目中的实际使用情况是：
+
+```text
+外部设备中断：走 PLIC
+时钟中断：走 time/stimecmp/SSTC
+CLINT 地址：保留在 memlayout.h，但主 timer 路径未直接操作传统 CLINT mtimecmp
+```
+
+### 11.1 PLIC：平台级外部中断控制器
+
+PLIC 负责外部设备中断，例如：
+
+```text
+UART 输入中断
+virtio disk 完成中断
+```
+
+外设产生中断后，PLIC 负责记录 pending、比较优先级、检查 enable 位和 threshold，并把 external interrupt 送给对应 hart。
+
+xv6 的 PLIC 代码在 [`kernel/plic.c`](../kernel/plic.c)。
+
+全局初始化：
+
+```c
+void
+plicinit(void)
+{
+  *(uint32 *)(PLIC + UART0_IRQ * 4) = 1;
+  *(uint32 *)(PLIC + VIRTIO0_IRQ * 4) = 1;
+}
+```
+
+含义：
+
+```text
+把 UART 和 virtio disk 的 IRQ 优先级设置为 1
+优先级为 0 表示该中断源禁用
+```
+
+每个 hart 初始化：
+
+```c
+void
+plicinithart(void)
+{
+  int hart = cpuid();
+
+  *(uint32 *)PLIC_SENABLE(hart) =
+    (1 << UART0_IRQ) | (1 << VIRTIO0_IRQ);
+
+  *(uint32 *)PLIC_SPRIORITY(hart) = 0;
+}
+```
+
+含义：
+
+```text
+允许当前 hart 的 S-mode 接收 UART 和 virtio disk 中断
+把当前 hart 的 S-mode priority threshold 设置为 0
+```
+
+外部中断处理路径：
+
+```text
+UART / virtio disk
+  -> PLIC
+  -> supervisor external interrupt
+  -> scause = 0x8000000000000009
+  -> trap.c:devintr()
+  -> plic_claim()
+  -> uartintr() 或 virtio_disk_intr()
+  -> plic_complete()
+```
+
+xv6 在 [`kernel/trap.c`](../kernel/trap.c) 中判断 external interrupt：
+
+```c
+if (scause == 0x8000000000000009L) {
+  int irq = plic_claim();
+
+  if (irq == UART0_IRQ) {
+    uartintr();
+  } else if (irq == VIRTIO0_IRQ) {
+    virtio_disk_intr();
+  }
+
+  if (irq)
+    plic_complete(irq);
+
+  return 1;
+}
+```
+
+`plic_claim()` 的作用是从 PLIC 取出当前 hart 应处理的 IRQ；`plic_complete(irq)` 告诉 PLIC 该 IRQ 已经处理完成，之后该设备才能继续产生同类中断。
+
+### 11.2 CLINT：核心本地中断控制器
+
+CLINT 传统上负责每个 hart 的本地中断：
+
+```text
+timer interrupt
+software interrupt
+```
+
+常见 CLINT 寄存器包括：
+
+```text
+msip       software interrupt pending
+mtime      全局时间计数器
+mtimecmp   每个 hart 的 timer compare
+```
+
+它和 PLIC 的职责差异：
+
+```text
+PLIC   处理平台外设中断，来自 UART、磁盘等外设
+CLINT  处理 hart-local 中断，主要是 timer 和 software interrupt
+```
+
+本项目在 [`kernel/memlayout.h`](../kernel/memlayout.h) 中保留了 CLINT 地址宏：
+
+```c
+#define CLINT_BASE  0x02000000L
+#define CLINT(hart) (CLINT_BASE + (hart) * 4)
+```
+
+但当前 timer 主路径并没有直接写传统 CLINT 的 `mtimecmp` MMIO，而是使用 SSTC 提供的 `stimecmp` CSR。这是和一些早期 xv6-riscv 版本不同的地方。
+
+### 11.3 SSTC：S-mode timer compare
+
+SSTC 让 supervisor mode 可以直接使用 `stimecmp` 设置 S-mode timer interrupt 的下一次触发时间。
+
+xv6 在 [`kernel/start.c`](../kernel/start.c) 的 `timerinit()` 中启用 SSTC：
+
+```c
+w_menvcfg(r_menvcfg() | MENVCFG_STCE);
+w_mcounteren(r_mcounteren() | 2);
+w_stimecmp(r_time() + 1000000);
+```
+
+含义：
+
+```text
+menvcfg.STCE      启用 S-mode timer compare
+mcounteren bit 1  允许 S-mode 读取 time
+stimecmp          设置第一次 timer interrupt
+```
+
+timer interrupt 到期后，`scause` 为：
+
+```text
+0x8000000000000005  supervisor timer interrupt
+```
+
+在 [`kernel/trap.c`](../kernel/trap.c) 的 `devintr()` 中：
+
+```c
+} else if (scause == 0x8000000000000005L) {
+  clockintr();
+  return 2;
+}
+```
+
+`clockintr()` 会更新时间并设置下一次 timer interrupt：
+
+```c
+w_stimecmp(r_time() + 1000000);
+```
+
+如果这个 timer interrupt 来自用户进程运行期间，`usertrap()` 后续会：
+
+```c
+if (which_dev == 2)
+  yield();
+```
+
+这就是 xv6 抢占式调度的时钟基础。
+
+### 11.4 PLIC、CLINT、SSTC 对比
+
+| 模块 | 职责 | 典型中断 | 本项目使用情况 |
+|---|---|---|---|
+| PLIC | 平台级外部中断控制器 | UART、virtio disk | 实际使用，见 `plic.c` 和 `devintr()` |
+| CLINT | hart 本地中断控制器 | timer、software interrupt | 保留地址宏，当前主 timer 路径不直接操作传统 `mtimecmp` |
+| SSTC/stimecmp | S-mode timer compare | supervisor timer interrupt | 实际使用，见 `timerinit()` 和 `clockintr()` |
+
+完整中断路径可以概括为：
+
+```text
+外部设备中断：
+  UART / virtio disk
+    -> PLIC
+    -> scause = supervisor external interrupt
+    -> devintr()
+    -> plic_claim()
+    -> uartintr() / virtio_disk_intr()
+    -> plic_complete()
+
+时钟中断：
+  time >= stimecmp
+    -> scause = supervisor timer interrupt
+    -> devintr()
+    -> clockintr()
+    -> ticks++
+    -> w_stimecmp(r_time() + 1000000)
+    -> yield() if running user process
+```
+
+一句话总结：
+
+```text
+PLIC 管“外设打断 CPU”；
+CLINT 传统上管“每个 CPU 自己的 timer/software interrupt”；
+这份 xv6 的外设中断走 PLIC，时钟中断走 SSTC 的 time/stimecmp。
+```
+
+## 12. User-level CSR
 
 常见 U-level CSR：
 
@@ -671,7 +1107,7 @@ xv6 用户程序通常不直接依赖 U-level CSR，而是通过系统调用获�
 uptime()
 ```
 
-## 11. trap 时 CSR 如何配合
+## 13. trap 时 CSR 如何配合
 
 用户态系统调用：
 
@@ -716,7 +1152,7 @@ page fault 路径：
   -> 失败则 setkilled(p)
 ```
 
-## 12. 各模式访问权限总表
+## 14. 各模式访问权限总表
 
 ```text
                  U-mode          S-mode          M-mode
@@ -739,7 +1175,7 @@ medeleg/mideleg  不可访问        不可访问        可访问
 - `cycle/time/instret` 这类计数器是否能在 U/S mode 访问，还受 `counteren` 控制。
 - FPR/Vector 是否能操作，还受 `FS/VS` 状态控制。
 
-## 13. xv6 最核心的寄存器闭环
+## 15. xv6 最核心的寄存器闭环
 
 xv6 启动阶段：
 
