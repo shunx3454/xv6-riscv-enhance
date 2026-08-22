@@ -2751,9 +2751,10 @@ lazy_copyinstr(char *s)
 void
 lazy_sbrk(char *s)
 {
-  // sbrk() takes just int, so take 2^30-sized steps towards MAXVA
+  // sbrk() takes just int, so take 2^30-sized steps towards MMAPBASE.
+  // The upper half of the user address space is reserved for mmap.
   char *p = sbrk(0);
-  while ((uint64)p < MAXVA - (1 << 30)) {
+  while ((uint64)p < MMAPBASE - (1 << 30)) {
     p = sbrklazy(1 << 30);
     if (p < 0) {
       printf("sbrklazy(%d) returned %p\n", 1 << 30, p);
@@ -2763,7 +2764,7 @@ lazy_sbrk(char *s)
     p = sbrklazy(0);
   }
 
-  int n = TRAPFRAME - PGSIZE - (uint64)p;
+  int n = MMAPBASE - PGSIZE - (uint64)p;
 
   char *p1 = sbrklazy(n);
   if (p1 < 0 || p1 != p) {
@@ -2772,8 +2773,8 @@ lazy_sbrk(char *s)
   }
 
   p = sbrk(PGSIZE);
-  if (p < 0 || (uint64)p != TRAPFRAME - PGSIZE) {
-    printf("sbrk(%d) returned %p, not expected TRAPFRAME-PGSIZE\n", PGSIZE, p);
+  if (p < 0 || (uint64)p != MMAPBASE - PGSIZE) {
+    printf("sbrk(%d) returned %p, not expected MMAPBASE-PGSIZE\n", PGSIZE, p);
     exit(1);
   }
 

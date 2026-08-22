@@ -57,7 +57,7 @@ sys_sbrk(void)
     // memory, vmfault() will allocate it.
     if (addr + n < addr)
       return -1;
-    if (addr + n > TRAPFRAME)
+    if (addr + n > MMAPBASE)
       return -1;
     myproc()->sz += n;
   }

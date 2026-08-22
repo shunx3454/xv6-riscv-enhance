@@ -177,3 +177,35 @@ filewrite(struct file *f, uint64 addr, int n)
 
   return ret;
 }
+
+// Write kernel memory to an inode at an explicit offset without changing
+// f->off. mmap uses this when writing MAP_SHARED pages back to their file.
+int
+filewriteat(struct file *f, uint64 src, uint64 fileoff, int n)
+{
+  int r, i = 0;
+
+  if (n < 0 || f->writable == 0 || f->type != FD_INODE)
+    return -1;
+  if (fileoff > 0xffffffffU || fileoff + n < fileoff ||
+      fileoff + n > 0xffffffffU)
+    return -1;
+
+  int max = ((MAXOPBLOCKS - 1 - 1 - 2) / 2) * BSIZE;
+  while (i < n) {
+    int n1 = n - i;
+    if (n1 > max)
+      n1 = max;
+
+    begin_op();
+    ilock(f->ip);
+    r = writei(f->ip, 0, src + i, (uint)fileoff + i, n1);
+    iunlock(f->ip);
+    end_op();
+
+    if (r != n1)
+      break;
+    i += r;
+  }
+  return i == n ? n : -1;
+}

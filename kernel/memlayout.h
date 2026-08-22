@@ -61,3 +61,6 @@
 //   TRAPFRAME (p->trapframe, used by the trampoline)
 //   TRAMPOLINE (the same page as in the kernel)
 #define TRAPFRAME (TRAMPOLINE - PGSIZE)
+
+// Keep file-backed mappings separate from the executable, heap, and stack.
+#define MMAPBASE (MAXVA / 2)

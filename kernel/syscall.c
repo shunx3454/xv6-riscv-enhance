@@ -12,8 +12,10 @@ int
 fetchaddr(uint64 addr, uint64 *ip)
 {
   struct proc *p = myproc();
-  if (addr >= p->sz ||
-      addr + sizeof(uint64) > p->sz) // both tests needed, in case of overflow
+  if (addr + sizeof(uint64) < addr || addr + sizeof(uint64) > MAXVA)
+    return -1;
+  if (addr < MMAPBASE &&
+      (addr >= p->sz || addr + sizeof(uint64) > p->sz))
     return -1;
   if (copyin(p->pagetable, p->sz, (char *)ip, addr, sizeof(*ip)) != 0)
     return -1;
@@ -103,6 +105,8 @@ extern uint64 sys_link(void);
 extern uint64 sys_mkdir(void);
 extern uint64 sys_close(void);
 extern uint64 sys_sync(void);
+extern uint64 sys_mmap(void);
+extern uint64 sys_munmap(void);
 
 // An array mapping syscall numbers from syscall.h
 // to the function that handles the system call.
@@ -130,6 +134,8 @@ static uint64 (*syscalls[])(void) = {
   [SYS_mkdir]   sys_mkdir,
   [SYS_close]   sys_close,
   [SYS_sync]    sys_sync,
+  [SYS_mmap]    sys_mmap,
+  [SYS_munmap]  sys_munmap,
   // clang-format on
 };
 

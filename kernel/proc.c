@@ -5,6 +5,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "vm.h"
 
 struct cpu cpus[NCPU];
 
@@ -124,6 +125,7 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  memset(p->vmas, 0, sizeof(p->vmas));
 
   // Allocate a trapframe page.
   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
@@ -162,6 +164,7 @@ freeproc(struct proc *p)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
   p->sz = 0;
+  memset(p->vmas, 0, sizeof(p->vmas));
   p->pid = 0;
   p->name[0] = 0;
   p->chan = 0;
@@ -240,7 +243,7 @@ growproc(int n)
 
   sz = p->sz;
   if (n > 0) {
-    if (sz + n > TRAPFRAME) {
+    if ((uint64)n > MMAPBASE - sz) {
       return -1;
     }
     if ((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
@@ -274,6 +277,11 @@ kfork(void)
     return -1;
   }
   np->sz = p->sz;
+  if (vma_fork(p, np) < 0) {
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  }
 
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
@@ -330,6 +338,9 @@ kexit(int status)
   if (p == initproc)
     panic("init exiting");
 
+  // mmap files hold references independent of the descriptor table.
+  vma_unmap_all_from(p->pagetable, p->vmas, 1);
+
   // Close all open files.
   for (int fd = 0; fd < NOFILE; fd++) {
     if (p->ofile[fd]) {
@@ -372,6 +383,10 @@ kwait(uint64 addr)
   struct proc *pp;
   int havekids, pid;
   struct proc *p = myproc();
+
+  // copyout below runs while wait_lock and the child's lock are held.
+  if (addr != 0 && vmfault_range(p, addr, sizeof(int), VM_WRITE) < 0)
+    return -1;
 
   acquire(&wait_lock);
 

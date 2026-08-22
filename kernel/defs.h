@@ -9,6 +9,7 @@ struct spinlock;
 struct sleeplock;
 struct stat;
 struct superblock;
+struct vma;
 
 // bio.c
 void            binit(void);
@@ -34,6 +35,7 @@ void            fileinit(void);
 int             fileread(struct file*, uint64, int n);
 int             filestat(struct file*, uint64 addr);
 int             filewrite(struct file*, uint64, int n);
+int             filewriteat(struct file*, uint64, uint64, int);
 
 // fs.c
 void            fsinit(int);
@@ -60,6 +62,8 @@ void            ireclaim(int);
 void*           kalloc(void);
 void            kfree(void *);
 void            kinit(void);
+void            kaddref(uint64);
+int             krefcnt(uint64);
 
 // log.c
 void            initlog(int, struct superblock*);
@@ -169,7 +173,12 @@ int             copyout(pagetable_t, uint64, uint64, char *, uint64);
 int             copyin(pagetable_t, uint64, char *, uint64, uint64);
 int             copyinstr(pagetable_t, uint64, char *, uint64, uint64);
 int             ismapped(pagetable_t, uint64);
-uint64          vmfault(pagetable_t, uint64, uint64, int);
+int             cow_break(pagetable_t, uint64);
+int             vmfault(struct proc*, uint64, int);
+int             vmfault_range(struct proc*, uint64, uint64, int);
+int             vma_fork(struct proc*, struct proc*);
+int             vma_unmap(struct proc*, struct vma*, int);
+void            vma_unmap_all_from(pagetable_t, struct vma*, int);
 
 // plic.c
 void            plicinit(void);

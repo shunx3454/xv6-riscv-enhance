@@ -6,6 +6,7 @@
 
 #include "types.h"
 #include "riscv.h"
+#include "memlayout.h"
 #include "defs.h"
 #include "param.h"
 #include "stat.h"
@@ -15,6 +16,7 @@
 #include "sleeplock.h"
 #include "file.h"
 #include "fcntl.h"
+#include "vm.h"
 
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
@@ -71,10 +73,15 @@ sys_read(void)
   struct file *f;
   int n;
   uint64 p;
+  struct proc *pr = myproc();
 
   argaddr(1, &p);
   argint(2, &n);
-  if (argfd(0, 0, &f) < 0)
+  if (argfd(0, 0, &f) < 0 || n < 0)
+    return -1;
+  // Some device and pipe implementations hold spinlocks while copying out.
+  // Resolve potentially sleeping mmap faults before entering those paths.
+  if (vmfault_range(pr, p, n, VM_WRITE) < 0)
     return -1;
   return fileread(f, p, n);
 }
@@ -85,10 +92,13 @@ sys_write(void)
   struct file *f;
   int n;
   uint64 p;
+  struct proc *pr = myproc();
 
   argaddr(1, &p);
   argint(2, &n);
-  if (argfd(0, 0, &f) < 0)
+  if (argfd(0, 0, &f) < 0 || n < 0)
+    return -1;
+  if (vmfault_range(pr, p, n, VM_READ) < 0)
     return -1;
 
   return filewrite(f, p, n);
@@ -114,9 +124,97 @@ sys_fstat(void)
   uint64 st; // user pointer to struct stat
 
   argaddr(1, &st);
-  if (argfd(0, 0, &f) < 0)
+  if (argfd(0, 0, &f) < 0 ||
+      vmfault_range(myproc(), st, sizeof(struct stat), VM_WRITE) < 0)
     return -1;
   return filestat(f, st);
+}
+
+uint64
+sys_mmap(void)
+{
+  uint64 requested, len, offset, maplen, candidate;
+  int prot, flags, slot = -1;
+  struct file *f;
+  struct proc *p = myproc();
+
+  argaddr(0, &requested);
+  argaddr(1, &len);
+  argint(2, &prot);
+  argint(3, &flags);
+  argaddr(5, &offset);
+  if (argfd(4, 0, &f) < 0 || requested != 0 || offset != 0 || len == 0)
+    return -1;
+  if ((prot & (PROT_READ | PROT_WRITE)) == 0)
+    return -1;
+  if (flags != MAP_PRIVATE && flags != MAP_SHARED)
+    return -1;
+  if (f->type != FD_INODE || !f->readable)
+    return -1;
+  if (flags == MAP_SHARED && (prot & PROT_WRITE) && !f->writable)
+    return -1;
+  if (len > TRAPFRAME - MMAPBASE)
+    return -1;
+  maplen = PGROUNDUP(len);
+  if (maplen < len || maplen > TRAPFRAME - MMAPBASE)
+    return -1;
+
+  for (int i = 0; i < NVMA; i++)
+    if (!p->vmas[i].used) {
+      slot = i;
+      break;
+    }
+  if (slot < 0)
+    return -1;
+
+  candidate = MMAPBASE;
+  for (;;) {
+    uint64 next = candidate;
+    int overlap = 0;
+
+    if (maplen > TRAPFRAME - candidate)
+      return -1;
+    for (int i = 0; i < NVMA; i++) {
+      struct vma *v = &p->vmas[i];
+      if (!v->used)
+        continue;
+      if (candidate < v->addr + v->maplen &&
+          candidate + maplen > v->addr) {
+        if (next < v->addr + v->maplen)
+          next = v->addr + v->maplen;
+        overlap = 1;
+      }
+    }
+    if (!overlap)
+      break;
+    candidate = next;
+  }
+
+  struct vma *v = &p->vmas[slot];
+  v->used = 1;
+  v->addr = candidate;
+  v->len = len;
+  v->maplen = maplen;
+  v->prot = prot & (PROT_READ | PROT_WRITE);
+  v->flags = flags;
+  v->file = filedup(f);
+  v->offset = 0;
+  return candidate;
+}
+
+uint64
+sys_munmap(void)
+{
+  uint64 addr, len;
+  struct proc *p = myproc();
+
+  argaddr(0, &addr);
+  argaddr(1, &len);
+  (void)len;
+  for (int i = 0; i < NVMA; i++)
+    if (p->vmas[i].used && p->vmas[i].addr == addr)
+      return vma_unmap(p, &p->vmas[i], 1);
+  return -1;
 }
 
 // Create the path new as a link to the same inode as old.
@@ -488,6 +586,8 @@ sys_pipe(void)
   struct proc *p = myproc();
 
   argaddr(0, &fdarray);
+  if (vmfault_range(p, fdarray, 2 * sizeof(int), VM_WRITE) < 0)
+    return -1;
   if (pipealloc(&rf, &wf) < 0)
     return -1;
   fd0 = -1;

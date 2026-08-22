@@ -66,6 +66,8 @@ kexec(char *path, char **argv)
       goto bad;
     if (ph.vaddr + ph.memsz < ph.vaddr)
       goto bad;
+    if (ph.vaddr + ph.memsz > MMAPBASE)
+      goto bad;
     if (ph.vaddr % PGSIZE != 0)
       goto bad;
     uint64 sz1;
@@ -87,6 +89,8 @@ kexec(char *path, char **argv)
   // Make the first inaccessible as a stack guard.
   // Use the rest as the user stack.
   sz = PGROUNDUP(sz);
+  if (sz > MMAPBASE - (USERSTACK + 1) * PGSIZE)
+    goto bad;
   uint64 sz1;
   if ((sz1 = uvmalloc(pagetable, sz, sz + (USERSTACK + 1) * PGSIZE, PTE_W)) ==
       0)
@@ -135,6 +139,7 @@ kexec(char *path, char **argv)
   p->sz = sz;
   p->trapframe->epc = elf.entry; // initial program counter = ulib.c:start()
   p->trapframe->sp = sp;         // initial stack pointer
+  vma_unmap_all_from(oldpagetable, p->vmas, 1);
   proc_freepagetable(oldpagetable, oldsz);
 
   return argc; // this ends up in a0, the first argument to main(argc, argv)
