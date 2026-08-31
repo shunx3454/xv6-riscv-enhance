@@ -3,12 +3,14 @@ struct buf;
 struct context;
 struct file;
 struct inode;
+struct mbuf;
 struct pipe;
 struct proc;
 struct spinlock;
 struct sleeplock;
 struct stat;
 struct superblock;
+struct socket;
 struct vma;
 
 // bio.c
@@ -190,6 +192,38 @@ void            plic_complete(int);
 void            virtio_disk_init(void);
 void            virtio_disk_rw(struct buf *, int);
 void            virtio_disk_intr(void);
+
+// pci.c：发现并配置 QEMU E1000 PCI 设备
+void            pci_init(void);
+
+// e1000.c：网卡初始化、DMA 收发和中断处理
+void            e1000_init(uint32 *);
+int             e1000_transmit(struct mbuf *);
+void            e1000_intr(void);
+
+// net.c：mbuf、Ethernet、ARP、IPv4 和 ICMP
+void            net_init(void);
+void            net_rx(struct mbuf *);
+uint32          net_local_ip(void);
+uint16          inet_checksum(void *, int);
+int             eth_tx(struct mbuf *, const uint8 *, uint16);
+int             ip_tx(struct mbuf *, uint32, uint8);
+
+// udp.c：UDP 封装、解析和接收分用
+int             udp_tx(struct mbuf *, uint16, uint32, uint16);
+void            udp_rx(struct mbuf *, uint32, uint32);
+
+// socket.c：UDP socket 表、阻塞接收队列和用户数据收发
+void            socketinit(void);
+struct socket*  socketalloc(void);
+void            socketclose(struct socket *);
+int             socket_bind(struct socket *, uint32, uint16);
+int             socket_connect(struct socket *, uint32, uint16);
+int             socket_sendto(struct socket *, uint64, int, int, uint32, uint16);
+int             socket_recvfrom(struct socket *, uint64, int, uint64, uint64);
+int             socketread(struct socket *, uint64, int);
+int             socketwrite(struct socket *, uint64, int);
+void            socket_rx_udp(struct mbuf *, uint32, uint16, uint32, uint16);
 
 // number of elements in fixed-size array
 #define NELEM(x) (sizeof(x) / sizeof((x)[0]))

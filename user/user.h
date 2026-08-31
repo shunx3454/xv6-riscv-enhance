@@ -1,6 +1,7 @@
 #define SBRK_ERROR ((char *)-1)
 
 struct stat;
+struct sockaddr_in;
 
 // system calls
 int fork(void);
@@ -27,6 +28,12 @@ int uptime(void);
 int sync(void);
 void *mmap(void *, uint64, int, int, int, uint64);
 int munmap(void *, uint64);
+// IPv4 UDP socket 用户态系统调用声明，sockaddr 字段使用网络字节序。
+int socket(int, int, int);
+int bind(int, const struct sockaddr_in *, int);
+int connect(int, const struct sockaddr_in *, int);
+int sendto(int, const void *, int, int, const struct sockaddr_in *, int);
+int recvfrom(int, void *, int, int, struct sockaddr_in *, int *);
 
 // ulib.c
 int stat(const char *, struct stat *);

@@ -1,10 +1,12 @@
 struct file {
-  enum { FD_NONE, FD_PIPE, FD_INODE, FD_DEVICE } type;
+  // FD_SOCKET 让网络端点复用 xv6 的 fd 引用计数、dup/fork/close 语义。
+  enum { FD_NONE, FD_PIPE, FD_INODE, FD_DEVICE, FD_SOCKET } type;
   int ref; // reference count
   char readable;
   char writable;
   struct pipe *pipe; // FD_PIPE
   struct inode *ip;  // FD_INODE and FD_DEVICE
+  struct socket *socket; // FD_SOCKET 对应的内核 UDP socket
   uint off;          // FD_INODE
   short major;       // FD_DEVICE
 };

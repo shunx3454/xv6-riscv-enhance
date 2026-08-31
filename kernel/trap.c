@@ -202,6 +202,9 @@ devintr()
       uartintr();
     } else if (irq == VIRTIO0_IRQ) {
       virtio_disk_intr();
+    } else if (irq == E1000_IRQ) {
+      // 网卡中断负责回收发送描述符并把新收到的包上送协议栈。
+      e1000_intr();
     } else if (irq) {
       printk("unexpected interrupt irq=%d\n", irq);
     }

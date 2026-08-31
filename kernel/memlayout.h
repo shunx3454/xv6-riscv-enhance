@@ -25,6 +25,14 @@
 #define VIRTIO0     0x10001000
 #define VIRTIO0_IRQ 1
 
+// QEMU virt 的 PCIe ECAM 配置空间，以及 pci_init() 为 E1000 BAR0
+// 指定的 MMIO 区域。E1000 通过 PLIC 的 33 号中断通知 CPU。
+#define PCIE_ECAM       0x30000000L
+#define PCIE_ECAM_SIZE  0x10000000L
+#define E1000_MMIO      0x40000000L
+#define E1000_MMIO_SIZE 0x00020000L
+#define E1000_IRQ       33
+
 // core-local interrupt controller (CLINT)
 #define CLINT_BASE  0x02000000L
 #define CLINT(hart) (CLINT_BASE + (hart) * 4)

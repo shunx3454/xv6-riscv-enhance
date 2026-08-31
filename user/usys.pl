@@ -45,3 +45,8 @@ entry("uptime");
 entry("sync");
 entry("mmap");
 entry("munmap");
+entry("socket");
+entry("bind");
+entry("connect");
+entry("sendto");
+entry("recvfrom");

@@ -36,6 +36,10 @@ kvmmake(void)
   // virtio mmio disk interface
   kvmmap(kpgtbl, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
 
+  // 内核以恒等映射访问 PCIe 配置空间和 E1000 MMIO 寄存器。
+  kvmmap(kpgtbl, PCIE_ECAM, PCIE_ECAM, PCIE_ECAM_SIZE, PTE_R | PTE_W);
+  kvmmap(kpgtbl, E1000_MMIO, E1000_MMIO, E1000_MMIO_SIZE, PTE_R | PTE_W);
+
   // PLIC
   kvmmap(kpgtbl, PLIC, PLIC, 0x4000000, PTE_R | PTE_W);
 

@@ -28,7 +28,13 @@ OBJS = \
   $K/sysfile.o \
   $K/kernelvec.o \
   $K/plic.o \
-  $K/virtio_disk.o
+  $K/virtio_disk.o \
+  $K/pci.o \
+  $K/e1000.o \
+  $K/net.o \
+  $K/udp.o \
+  $K/socket.o \
+  $K/syssock.o
 
 # riscv64-unknown-elf- or riscv64-linux-gnu-
 # perhaps in /opt/riscv/bin
@@ -147,6 +153,7 @@ UPROGS=\
 	$U/_dorphan\
 	$U/_sync\
 	$U/_cowmmaptest\
+	$U/_nettest\
 
 fs.img: mkfs/mkfs README $(UPROGS)
 	mkfs/mkfs fs.img README $(UPROGS)
@@ -154,7 +161,7 @@ fs.img: mkfs/mkfs README $(UPROGS)
 -include kernel/*.d user/*.d
 
 clean: 
-	rm -f *.tex *.dvi *.idx *.aux *.log *.ind *.ilg \
+	rm -f *.tex *.dvi *.idx *.aux *.log *.ind *.ilg *.pcap \
 	*/*.o */*.d */*.asm */*.sym \
 	$K/kernel fs.img \
 	mkfs/mkfs .gdbinit \
@@ -168,13 +175,17 @@ QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
 	then echo "-gdb tcp::$(GDBPORT)"; \
 	else echo "-s -p $(GDBPORT)"; fi)
 ifndef CPUS
-CPUS := 3
+CPUS := 4
 endif
 
 QEMUOPTS = -machine virt -bios none -kernel $K/kernel -m 128M -smp $(CPUS) -nographic
 QEMUOPTS += -global virtio-mmio.force-legacy=false
 QEMUOPTS += -drive file=fs.img,if=none,format=raw,id=x0
 QEMUOPTS += -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
+# QEMUOPTS += -netdev user,id=net0,hostfwd=udp::$(FWDPORT)-:2000
+# QEMUOPTS += -object filter-dump,id=netdump,netdev=net0,file=packets.pcap
+QEMUOPTS += -netdev tap,id=net0,ifname=xv6tap0,script=no,downscript=no
+QEMUOPTS += -device e1000,netdev=net0,bus=pcie.0
 
 qemu: check-qemu-version $K/kernel fs.img
 	$(QEMU) $(QEMUOPTS)

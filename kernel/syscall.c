@@ -107,6 +107,12 @@ extern uint64 sys_close(void);
 extern uint64 sys_sync(void);
 extern uint64 sys_mmap(void);
 extern uint64 sys_munmap(void);
+// IPv4 UDP socket 系统调用入口。
+extern uint64 sys_socket(void);
+extern uint64 sys_bind(void);
+extern uint64 sys_connect(void);
+extern uint64 sys_sendto(void);
+extern uint64 sys_recvfrom(void);
 
 // An array mapping syscall numbers from syscall.h
 // to the function that handles the system call.
@@ -136,6 +142,12 @@ static uint64 (*syscalls[])(void) = {
   [SYS_sync]    sys_sync,
   [SYS_mmap]    sys_mmap,
   [SYS_munmap]  sys_munmap,
+  // 将用户态 socket API 编号映射到 syssock.c 的内核实现。
+  [SYS_socket]  sys_socket,
+  [SYS_bind]    sys_bind,
+  [SYS_connect] sys_connect,
+  [SYS_sendto]  sys_sendto,
+  [SYS_recvfrom] sys_recvfrom,
   // clang-format on
 };
 

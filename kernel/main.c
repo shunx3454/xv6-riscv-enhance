@@ -28,6 +28,10 @@ main()
     iinit();            // inode table
     fileinit();         // file table
     virtio_disk_init(); // emulated hard disk
+    // 先初始化协议栈和 socket 锁，再启动可能产生中断的 E1000 设备。
+    net_init();         // Ethernet、ARP 和 IPv4 状态
+    socketinit();       // UDP socket 表
+    pci_init();         // PCI 探测和 E1000 网卡
     userinit();         // first user process
 
     __atomic_store_n(&started, 1, __ATOMIC_RELEASE);

@@ -23,3 +23,9 @@
 #define SYS_sync   22
 #define SYS_mmap   23
 #define SYS_munmap 24
+// 第一版网络 ABI：仅支持 AF_INET/SOCK_DGRAM/UDP。
+#define SYS_socket 25
+#define SYS_bind   26
+#define SYS_connect  27
+#define SYS_sendto   28
+#define SYS_recvfrom 29
