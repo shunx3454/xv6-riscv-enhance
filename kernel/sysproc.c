@@ -46,7 +46,8 @@ sys_sbrk(void)
   argint(0, &n);
   argint(1, &t);
   addr = myproc()->sz;
-
+  
+  // 立即分配 || 收缩内存
   if (t == SBRK_EAGER || n < 0) {
     if (growproc(n) < 0) {
       return -1;

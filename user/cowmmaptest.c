@@ -230,6 +230,76 @@ copytest(char *path)
   close(fd);
 }
 
+static void
+anontest(void)
+{
+  int fds[2], status;
+  char buf[2];
+  char *p;
+
+  // 目前只实现私有匿名映射，并要求匿名映射的 fd 为 -1。
+  if (mmap(0, PGSIZE, PROT_READ | PROT_WRITE,
+           MAP_SHARED | MAP_ANONYMOUS, -1, 0) != (void *)-1)
+    fail("shared anonymous accepted");
+  if (mmap(0, PGSIZE, PROT_READ | PROT_WRITE,
+           MAP_PRIVATE | MAP_ANONYMOUS, 0, 0) != (void *)-1)
+    fail("anonymous fd accepted");
+
+  p = mmap(0, 4 * PGSIZE, PROT_READ | PROT_WRITE,
+           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (p == (void *)-1)
+    fail("anonymous mmap");
+  if (p[0] != 0 || p[4 * PGSIZE - 1] != 0)
+    fail("anonymous zero fill");
+
+  // 第一页在 fork 前驻留，fork 后必须通过 COW 隔离。
+  p[0] = 'P';
+  int pid = fork();
+  if (pid < 0)
+    fail("anonymous fork");
+  if (pid == 0) {
+    if (p[0] != 'P' || p[PGSIZE] != 0)
+      exit(1);
+    p[0] = 'C';
+    p[PGSIZE] = 'X';
+    exit(p[0] == 'C' && p[PGSIZE] == 'X' ? 0 : 1);
+  }
+  if (wait(&status) != pid || status != 0)
+    fail("anonymous child");
+  if (p[0] != 'P' || p[PGSIZE] != 0)
+    fail("anonymous fork isolation");
+
+  // 匿名页也可以作为系统调用的 copyout/copyin 缓冲区。
+  if (pipe(fds) < 0 || write(fds[1], "OK", 2) != 2 ||
+      read(fds[0], p + 2 * PGSIZE, 2) != 2 ||
+      write(fds[1], p + 2 * PGSIZE, 2) != 2 ||
+      read(fds[0], buf, sizeof(buf)) != sizeof(buf) ||
+      memcmp(buf, "OK", sizeof(buf)) != 0)
+    fail("anonymous syscall buffer");
+  close(fds[0]);
+  close(fds[1]);
+
+  if (munmap(p, 4 * PGSIZE) < 0)
+    fail("anonymous munmap");
+
+  // 只读匿名页应保持只读，写入它的子进程会因页故障退出。
+  p = mmap(0, PGSIZE, PROT_READ,
+           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (p == (void *)-1 || p[0] != 0)
+    fail("readonly anonymous mmap");
+  pid = fork();
+  if (pid < 0)
+    fail("readonly anonymous fork");
+  if (pid == 0) {
+    p[0] = 1;
+    exit(0);
+  }
+  if (wait(&status) != pid || status != -1)
+    fail("readonly anonymous protection");
+  if (munmap(p, PGSIZE) < 0)
+    fail("readonly anonymous munmap");
+}
+
 int
 main(void)
 {
@@ -242,6 +312,7 @@ main(void)
   lifecycletest(path);
   protectiontest(path);
   copytest(path);
+  anontest();
   unlink(path);
   printf("cowmmaptest: OK\n");
   exit(0);

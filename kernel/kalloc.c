@@ -21,9 +21,10 @@ struct run {
 struct {
   struct spinlock lock;
   struct run *freelist;
-  int refcnt[(PHYSTOP - KERNBASE) / PGSIZE];
+  int refcnt[(PHYSTOP - KERNBASE) / PGSIZE];  // kernel base 到 的PHYSTOP 物理页引用计数
 } kmem;
 
+// 从kernel base 的 物理页索引
 #define PAINDEX(pa) (((uint64)(pa) - KERNBASE) / PGSIZE)
 
 void
@@ -33,6 +34,7 @@ kinit()
   freerange(end, (void *)PHYSTOP);
 }
 
+// 仅初始化调用
 void
 freerange(void *pa_start, void *pa_end)
 {

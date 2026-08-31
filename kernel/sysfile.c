@@ -134,25 +134,38 @@ uint64
 sys_mmap(void)
 {
   uint64 requested, len, offset, maplen, candidate;
-  int prot, flags, slot = -1;
-  struct file *f;
+  int prot, flags, fd, type, anonymous, slot = -1;
+  struct file *f = 0;
   struct proc *p = myproc();
 
   argaddr(0, &requested);
   argaddr(1, &len);
   argint(2, &prot);
   argint(3, &flags);
+  argint(4, &fd);
   argaddr(5, &offset);
-  if (argfd(4, 0, &f) < 0 || requested != 0 || offset != 0 || len == 0)
+  if (requested != 0 || offset != 0 || len == 0)
     return -1;
   if ((prot & (PROT_READ | PROT_WRITE)) == 0)
     return -1;
-  if (flags != MAP_PRIVATE && flags != MAP_SHARED)
+
+  // 映射类型必须且只能选择 PRIVATE 或 SHARED；当前只支持私有匿名映射。
+  if (flags & ~(MAP_PRIVATE | MAP_SHARED | MAP_ANONYMOUS))
     return -1;
-  if (f->type != FD_INODE || !f->readable)
+  type = flags & (MAP_PRIVATE | MAP_SHARED);
+  anonymous = (flags & MAP_ANONYMOUS) != 0;
+  if (type != MAP_PRIVATE && type != MAP_SHARED)
     return -1;
-  if (flags == MAP_SHARED && (prot & PROT_WRITE) && !f->writable)
-    return -1;
+  if (anonymous) {
+    // 匿名映射没有后端文件。MAP_SHARED | MAP_ANONYMOUS 暂不支持。
+    if (type != MAP_PRIVATE || fd != -1)
+      return -1;
+  } else {
+    if (argfd(4, 0, &f) < 0 || f->type != FD_INODE || !f->readable)
+      return -1;
+    if (type == MAP_SHARED && (prot & PROT_WRITE) && !f->writable)
+      return -1;
+  }
   if (len > TRAPFRAME - MMAPBASE)
     return -1;
   maplen = PGROUNDUP(len);
@@ -197,7 +210,7 @@ sys_mmap(void)
   v->maplen = maplen;
   v->prot = prot & (PROT_READ | PROT_WRITE);
   v->flags = flags;
-  v->file = filedup(f);
+  v->file = anonymous ? 0 : filedup(f);
   v->offset = 0;
   return candidate;
 }

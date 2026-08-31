@@ -191,6 +191,7 @@ proc_pagetable(struct proc *p)
   // to/from user space, so not PTE_U.
   if (mappages(pagetable, TRAMPOLINE, PGSIZE, (uint64)trampoline,
                PTE_R | PTE_X) < 0) {
+    // 虽然没释放虚拟内存映射，但是会释放进程3级页表
     uvmfree(pagetable, 0);
     return 0;
   }
@@ -199,7 +200,9 @@ proc_pagetable(struct proc *p)
   // trampoline.S.
   if (mappages(pagetable, TRAPFRAME, PGSIZE, (uint64)(p->trapframe),
                PTE_R | PTE_W) < 0) {
+    // TRAMPOLINE 映射释放不需要释放内存
     uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+    // 虽然没释放虚拟内存映射，但是会释放进程3级页表
     uvmfree(pagetable, 0);
     return 0;
   }
@@ -207,13 +210,17 @@ proc_pagetable(struct proc *p)
   return pagetable;
 }
 
+// 释放进程所有映射，并释放页表内存
 // Free a process's page table, and free the
 // physical memory it refers to.
 void
 proc_freepagetable(pagetable_t pagetable, uint64 sz)
 {
+    // TRAMPOLINE 映射释放不需要释放内存
   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+    // TRAPFRAME 映射释放不需要释放内存
   uvmunmap(pagetable, TRAPFRAME, 1, 0);
+    // 虽然没释放虚拟内存映射，但是会释放进程3级页表
   uvmfree(pagetable, sz);
 }
 

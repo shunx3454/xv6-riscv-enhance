@@ -21,6 +21,7 @@ extern char etext[]; // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[]; // trampoline.S
 
+// 创建内核页表直接映射
 // Make a direct-map page table for the kernel.
 pagetable_t
 kvmmake(void)
@@ -91,6 +92,7 @@ kvminithart()
   sfence_vma();
 }
 
+// 查找物理页表项；如果 alloc!=0 则沿途可创建页表
 // Return the address of the PTE in page table pagetable
 // that corresponds to virtual address va.  If alloc!=0,
 // create any required page-table pages.
@@ -123,6 +125,7 @@ walk(pagetable_t pagetable, uint64 va, int alloc)
   return &pagetable[PX(0, va)];
 }
 
+// 查找虚拟地址对应的物理地址
 // Look up a virtual address, return the physical address,
 // or 0 if not mapped.
 // Can only be used to look up user pages.
@@ -146,6 +149,7 @@ walkaddr(pagetable_t pagetable, uint64 va)
   return pa;
 }
 
+// 映射指定大小虚拟内存，页表不存在直接分配
 // Create PTEs for virtual addresses starting at va that refer to
 // physical addresses starting at pa.
 // va and size MUST be page-aligned.
@@ -182,6 +186,7 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
   return 0;
 }
 
+// 用户进程 创建空的三级页表
 // create an empty user page table.
 // returns 0 if out of memory.
 pagetable_t
@@ -195,6 +200,7 @@ uvmcreate()
   return pagetable;
 }
 
+// 取消 va 开始的虚拟地址映射，do_free 并释放物理页
 // Remove npages of mappings starting from va. va must be
 // page-aligned. It's OK if the mappings don't exist.
 // Optionally free the physical memory.
@@ -220,6 +226,7 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
   }
 }
 
+// 用户虚拟地址增加
 // Allocate PTEs and physical memory to grow a process from oldsz to
 // newsz, which need not be page aligned.  Returns new size or 0 on error.
 uint64
@@ -228,6 +235,7 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
   char *mem;
   uint64 a;
 
+  // 不显示释放
   if (newsz < oldsz)
     return oldsz;
 
@@ -239,6 +247,7 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
       return 0;
     }
     memset(mem, 0, PGSIZE);
+    // 映射一页，给上权限
     if (mappages(pagetable, a, PGSIZE, (uint64)mem, PTE_R | PTE_U | xperm) !=
         0) {
       kfree(mem);
@@ -249,6 +258,7 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
   return newsz;
 }
 
+// 用户进程虚拟地址收缩，并显示 do free
 // Deallocate user pages to bring the process size from oldsz to
 // newsz.  oldsz and newsz need not be page-aligned, nor does newsz
 // need to be less than oldsz.  oldsz can be larger than the actual
@@ -267,6 +277,7 @@ uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
   return newsz;
 }
 
+// 释放页表本身
 // Recursively free page-table pages.
 // All leaf mappings must already have been removed.
 void
@@ -287,6 +298,7 @@ freewalk(pagetable_t pagetable)
   kfree((void *)pagetable);
 }
 
+// 取消所有用户内存映射并释放内存，进程页表本身也释放
 // Free user memory pages,
 // then free page-table pages.
 void
@@ -297,6 +309,7 @@ uvmfree(pagetable_t pagetable, uint64 sz)
   freewalk(pagetable);
 }
 
+// 不会 直接内存 复制：找到old进程的 WRITE 权限的页，变为只读，加上 PTE_COW 权限
 // Given a parent process's page table, copy its low user address space into a
 // child's page table using copy-on-write mappings.
 // returns 0 on success, -1 on failure.
@@ -316,17 +329,25 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       continue; // physical page hasn't been allocated
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
+
+    // 找到old进程的 WRITE 权限的页
+    // 变为只读，加上 PTE_COW 权限
     if (flags & PTE_W) {
       flags = (flags & ~PTE_W) | PTE_COW;
       *pte = PA2PTE(pa) | flags;
       changed = 1;
     }
+
+    // old page 读写权限 拷贝都需要增加引用计数
     kaddref(pa);
+
+    // 并映射到 新进程的页表上
     if (mappages(new, i, PGSIZE, pa, flags) != 0) {
       kfree((void *)pa);
       goto err;
     }
   }
+
   if (changed)
     sfence_vma();
   return 0;
@@ -338,6 +359,9 @@ err:
   return -1;
 }
 
+// COW 的物理页 写page 异常处理
+// 该页引用计数为1,则直接给写权限
+// 引用计数为 > 1，不要使用旧的物理页，直接分配新的，并给上WRITE写权限，最后把原来的 COW page 内容拷贝过来
 // Make a COW mapping writable, copying its page if another mapping still
 // refers to the old physical page.
 int
@@ -354,6 +378,7 @@ cow_break(pagetable_t pagetable, uint64 va)
 
   oldpa = PTE2PA(*pte);
   flags = PTE_FLAGS(*pte);
+  // 该页引用计数为1,则直接给写权限
   if (krefcnt(oldpa) == 1) {
     flags = (flags | PTE_W) & ~PTE_COW;
     *pte = PA2PTE(oldpa) | flags;
@@ -361,6 +386,8 @@ cow_break(pagetable_t pagetable, uint64 va)
     return 0;
   }
 
+  // 引用计数为 > 1，不要使用旧的物理页，直接分配新的，并给上WRITE写权限，
+  // 最后把原来的 COW page 内容拷贝过来
   mem = kalloc();
   if (mem == 0)
     return -1;
@@ -372,6 +399,7 @@ cow_break(pagetable_t pagetable, uint64 va)
   return 0;
 }
 
+// 取消 物理页 用户权限
 // mark a PTE invalid for user access.
 // used by exec for the user stack guard page.
 void
@@ -403,6 +431,13 @@ copyout(pagetable_t pagetable, uint64 psz, uint64 dstva, char *src, uint64 len)
       return -1;
 
     if (p != 0 && pagetable == p->pagetable &&
+      // 这里强制进行一次page fault检查
+      // 如果 dstva 是COW 内核写触发异常会失败
+      // 需要先把以下情况排除
+      // - 分裂 COW 页
+      // - 分配 lazy heap 页
+      // - 加载 mmap 文件页
+      // - 检查写权限
         vmfault(p, dstva, VM_WRITE) < 0)
       return -1;
     pte = walk(pagetable, va0, 0);
@@ -440,6 +475,10 @@ copyin(pagetable_t pagetable, uint64 psz, char *dst, uint64 srcva, uint64 len)
     if (va0 >= MAXVA)
       return -1;
     if (p != 0 && pagetable == p->pagetable &&
+      // 和copyout 同理，提前排查
+      // - 分配 lazy heap 页
+      // - 加载 mmap 文件页
+      // - 检查读权限
         vmfault(p, srcva, VM_READ) < 0)
       return -1;
     pte = walk(pagetable, va0, 0);
@@ -479,6 +518,10 @@ copyinstr(pagetable_t pagetable, uint64 psz, char *dst, uint64 srcva,
     if (va0 >= MAXVA)
       return -1;
     if (p != 0 && pagetable == p->pagetable &&
+        // 和copyout 同理，提前排查
+        // - 分配 lazy heap 页
+        // - 加载 mmap 文件页
+        // - 检查读权限
         vmfault(p, srcva, VM_READ) < 0)
       return -1;
     pte = walk(pagetable, va0, 0);
@@ -514,6 +557,7 @@ copyinstr(pagetable_t pagetable, uint64 psz, char *dst, uint64 srcva,
   }
 }
 
+// 查找 va 是否再进程 mmap中
 static struct vma *
 vma_find(struct proc *p, uint64 va)
 {
@@ -525,6 +569,8 @@ vma_find(struct proc *p, uint64 va)
   return 0;
 }
 
+// 建立 VMA 时不加载，第一次访问时才加载。匿名映射得到零页；文件映射
+// 还会从文件中读取当前页对应的内容。
 static int
 mmap_fault_page(struct proc *p, struct vma *v, uint64 va)
 {
@@ -538,29 +584,41 @@ mmap_fault_page(struct proc *p, struct vma *v, uint64 va)
     return -1;
   memset(mem, 0, PGSIZE);
 
+  // 地址偏移 4096 倍数
   pageoff = va - v->addr;
   if (pageoff >= v->len) {
     kfree(mem);
     return -1;
   }
-  n = PGSIZE;
-  if (n > v->len - pageoff)
-    n = v->len - pageoff;
-  fileoff = v->offset + pageoff;
 
-  if (fileoff <= 0xffffffffU) {
-    already_locked = holdingsleep(&v->file->ip->lock);
-    if (!already_locked)
-      ilock(v->file->ip);
-    r = readi(v->file->ip, 0, (uint64)mem, (uint)fileoff, (uint)n);
-    if (!already_locked)
-      iunlock(v->file->ip);
+  if ((v->flags & MAP_ANONYMOUS) == 0) {
+    if (v->file == 0) {
+      kfree(mem);
+      return -1;
+    }
+
+    // 文件映射最多读取本页仍处于用户请求长度内的部分；短读后的区域保持为零。
+    n = PGSIZE;
+    if (n > v->len - pageoff)
+      n = v->len - pageoff;
+    fileoff = v->offset + pageoff;
+
+    if (fileoff <= 0xffffffffU) {
+      // 如果当前路径已经持有 inode 锁，就不能重复加锁。
+      already_locked = holdingsleep(&v->file->ip->lock);
+      if (!already_locked)
+        ilock(v->file->ip);
+      r = readi(v->file->ip, 0, (uint64)mem, (uint)fileoff, (uint)n);
+      if (!already_locked)
+        iunlock(v->file->ip);
+    }
   }
   if (r < 0) {
     kfree(mem);
     return -1;
   }
 
+  // 根据mmap 权限，把新的mem映射到用户虚拟地址va上
   if (v->prot & PROT_READ)
     perm |= PTE_R;
   if (v->prot & PROT_WRITE)
@@ -586,6 +644,7 @@ vmfault(struct proc *p, uint64 va, int access)
     return -1;
   va0 = PGROUNDDOWN(va);
   pte = walk(p->pagetable, va0, 0);
+  // 处理 va虚拟内存分配有效 时
   if (pte != 0 && (*pte & PTE_V)) {
     if ((*pte & PTE_U) == 0)
       return -1;
@@ -598,11 +657,14 @@ vmfault(struct proc *p, uint64 va, int access)
     return 0;
   }
 
+  // 处理 va 虚拟内存无效时
+  // 可能是 heap lazy 分配
   if (va < p->sz && va < MMAPBASE) {
     mem = kalloc();
     if (mem == 0)
       return -1;
     memset(mem, 0, PGSIZE);
+    // 分配在堆heap，并给上 读写 权限
     if (mappages(p->pagetable, va0, PGSIZE, (uint64)mem,
                  PTE_R | PTE_W | PTE_U) < 0) {
       kfree(mem);
@@ -611,6 +673,7 @@ vmfault(struct proc *p, uint64 va, int access)
     return 0;
   }
 
+  // 处理 va 虚拟内存无效时
   v = vma_find(p, va);
   if (v == 0)
     return -1;
@@ -618,9 +681,44 @@ vmfault(struct proc *p, uint64 va, int access)
     return -1;
   if (access == VM_WRITE && (v->prot & PROT_WRITE) == 0)
     return -1;
+  // 处理 mmap lazy 的缺页异常
   return mmap_fault_page(p, v, va0);
 }
 
+  // 假设用户把文件映射区域作为 read() 的接收缓冲区：
+
+  // char *p = mmap(...);
+  // read(fd, p, 8192);
+  // p 对应的 mmap 页面可能还没加载。read() 最终会通过 copyout() 向 p 写数据。
+  // 问题在于某些 read() 路径可能已经持有：
+
+  // - pipe 自旋锁；
+  // - inode 睡眠锁；
+  // - 进程相关自旋锁。
+
+  // 如果这时 copyout() 才发现 mmap 页面不存在，就会进入：
+
+  // copyout()
+  //   ↓
+  // vmfault()
+  //   ↓
+  // mmap_fault_page()
+  //   ↓
+  // ilock()
+  //   ↓
+  // readi()
+  //   ↓
+  // 可能睡眠、磁盘 I/O
+
+  // 在持有自旋锁时睡眠是不允许的；如果已经持有同一个 inode 锁，还可能造成重复加锁或死锁。
+
+  // 因此系统调用先调用：
+
+  // vmfault_range(p, user_buffer, len, access);
+
+  // 把可能需要磁盘读取的 mmap 页面提前装入。完成后再进入真正的 I/O 路径。
+// 在进入可能持锁的内核 I/O 路径之前，预先加载用户缓冲区范围内尚未装入的 mmap 文件页，避免之后在锁内触发会睡眠的文件缺页处理。
+// vmfault_range() 主要预防的是 mmap 缺页时可能发生的磁盘 I/O和睡眠
 int
 vmfault_range(struct proc *p, uint64 va, uint64 len, int access)
 {
@@ -649,6 +747,7 @@ vmfault_range(struct proc *p, uint64 va, uint64 len, int access)
   return 0;
 }
 
+// 处理 进程 fork 子进程 的VMA 区域的
 // Copy VMA metadata and already-resident mmap pages during fork. Pages in
 // private writable mappings become COW; shared pages remain directly shared.
 int
@@ -663,7 +762,9 @@ vma_fork(struct proc *parent, struct proc *child)
       continue;
 
     *dst = *src;
-    dst->file = filedup(src->file);
+    // 匿名 VMA 没有文件引用；文件 VMA 需要为子进程单独持有一份引用。
+    if (src->file)
+      dst->file = filedup(src->file);
     for (uint64 a = src->addr; a < src->addr + src->maplen; a += PGSIZE) {
       pte_t *pte = walk(parent->pagetable, a, 0);
       uint64 pa, flags;
@@ -672,12 +773,17 @@ vma_fork(struct proc *parent, struct proc *child)
         continue;
       pa = PTE2PA(*pte);
       flags = PTE_FLAGS(*pte);
-      if (src->flags == MAP_PRIVATE && (flags & PTE_W)) {
+      // WRITE parent 改为 读权限 + PTE_COW
+      if ((src->flags & MAP_PRIVATE) && (flags & PTE_W)) {
         flags = (flags & ~PTE_W) | PTE_COW;
         *pte = PA2PTE(pa) | flags;
         changed = 1;
       }
+
+      // 读写都需要 页面引用计数
       kaddref(pa);
+
+      // 加入映射
       if (mappages(child->pagetable, a, PGSIZE, pa, flags) < 0) {
         kfree((void *)pa);
         goto bad;
@@ -707,7 +813,8 @@ vma_unmap_from(pagetable_t pagetable, struct vma *v, int writeback)
     if (pte == 0 || (*pte & PTE_V) == 0)
       continue;
 
-    if (writeback && v->flags == MAP_SHARED && (v->prot & PROT_WRITE)) {
+    if (writeback && v->file && (v->flags & MAP_SHARED) &&
+        (v->prot & PROT_WRITE)) {
       uint64 pageoff = a - v->addr;
       uint64 n = PGSIZE;
       if (n > v->len - pageoff)
@@ -717,7 +824,8 @@ vma_unmap_from(pagetable_t pagetable, struct vma *v, int writeback)
     }
     uvmunmap(pagetable, a, 1, 1);
   }
-  fileclose(v->file);
+  if (v->file)
+    fileclose(v->file);
   memset(v, 0, sizeof(*v));
   return ret;
 }
