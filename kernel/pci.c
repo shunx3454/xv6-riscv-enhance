@@ -128,8 +128,7 @@ pci_configure_e1000(volatile uint8 *config)
 
   // 驱动只使用 MMIO BAR，不需要开启 I/O Space。MASTER 是 E1000 读取 TX
   // 描述符/mbuf、写入 RX 描述符/mbuf 的必要条件。
-  pci_write16(config, PCI_COMMAND_REG,
-              command | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+  pci_write16(config, PCI_COMMAND_REG, command | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
   __sync_synchronize();
   (void)pci_read16(config, PCI_COMMAND_REG);
 

@@ -119,7 +119,7 @@ mbuftrim(struct mbuf *m, uint n)
   return m->head + m->len;
 }
 
-// RFC 1071 16 位反码和。逐字节读取可避免未对齐访问。
+// 16 位反码和。逐字节读取可避免未对齐访问。
 uint16
 inet_checksum(void *data, int len)
 {
@@ -192,7 +192,7 @@ arp_resolve_and_send(uint32 next_hop, struct mbuf *m)
       found = i;
       break;
     }
-    // ARP 缓冲失效，占用这个arp entry  
+    // ARP 缓冲失效，占用这个空的arp entry  
     if (slot < 0 && arptable.entry[i].state == ARP_EMPTY)
       slot = i;
   }

@@ -16,14 +16,19 @@ main()
     printk("\n");
     printk("xv6 kernel is booting\n");
     printk("\n");
+    // 虚拟内存
     kinit();            // physical page allocator
     kvminit();          // create kernel page table
     kvminithart();      // turn on paging
+
     procinit();         // process table
+    // 设置内核异常 stvec 寄存器
     trapinit();         // trap vectors
     trapinithart();     // install kernel trap vector
+    // PLIC初始化
     plicinit();         // set up interrupt controller
     plicinithart();     // ask PLIC for device interrupts
+    // 初始化缓冲
     binit();            // buffer cache
     iinit();            // inode table
     fileinit();         // file table

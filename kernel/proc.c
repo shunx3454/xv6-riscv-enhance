@@ -175,6 +175,7 @@ freeproc(struct proc *p)
 
 // Create a user page table for a given process, with no user memory,
 // but with trampoline and trapframe pages.
+// 创建新的空的用户进程页表，但是有trampoline trapframe 映射
 pagetable_t
 proc_pagetable(struct proc *p)
 {

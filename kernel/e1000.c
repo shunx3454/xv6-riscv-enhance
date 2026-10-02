@@ -19,6 +19,30 @@ static struct mbuf *rx_mbufs[RX_RING_SIZE];
 static volatile uint32 *regs;
 static struct spinlock e1000_lock;
 
+
+// TX:
+// TDBAL/TDBAH  TX descriptor ring base
+// TDLEN        TX ring length
+// TDH          TX descriptor head
+// TDT          TX descriptor tail
+
+// RX:
+// RDBAL/RDBAH  RX descriptor ring base
+// RDLEN        RX ring length
+// RDH          RX descriptor head
+// RDT          RX descriptor tail
+
+// Interrupt:
+// IMS          interrupt mask set
+// IMC          interrupt mask clear
+// ICR          interrupt cause read
+
+// Control:
+// TCTL
+// RCTL
+// TIPG
+
+
 void
 e1000_init(uint32 *xregs)
 {

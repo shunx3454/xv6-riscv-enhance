@@ -1667,3 +1667,708 @@ TX:
 ## 最重要的一句话
 
 > E1000 descriptor ring 的核心不是“数组怎么走”，而是用 `TDH/TDT/RDH/RDT + DD/EOP/RS` 在 software 和 hardware 之间明确表达 **queue 边界、packet 边界和 DMA buffer ownership**。
+
+
+
+
+这个 E1000 驱动的架构模型可以概括为：
+
+  协议栈 / socket
+     |
+     | mbuf
+     v
+  net.c: Ethernet/IP/ARP/UDP
+     |
+     | e1000_transmit() / net_rx()
+     v
+  e1000.c 驱动
+     |
+     | MMIO 控制寄存器 + DMA 描述符环
+     v
+  QEMU E1000 设备
+     |
+     | PLIC 外部中断 IRQ 33
+     v
+  trap.c -> e1000_intr()
+
+  1. 设备访问模型：MMIO + DMA
+
+  这个驱动不是用普通 I/O 指令访问网卡，而是使用 MMIO 寄存器 控制设备。
+
+  E1000 的 MMIO 基址固定配置为：
+
+  #define E1000_MMIO 0x40000000L
+
+  见 kernel/memlayout.h:32。
+
+  内核页表把它恒等映射：
+
+  kvmmap(kpgtbl, E1000_MMIO, E1000_MMIO,
+         E1000_MMIO_SIZE, PTE_R | PTE_W);
+
+  见 kernel/vm.c:42。
+
+  PCI 初始化时，会把 E1000 的 BAR0 配到这个地址，并开启：
+
+  PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER
+
+  见 kernel/pci.c:131。
+
+  其中 PCI_COMMAND_MASTER 很关键：它允许 E1000 作为 bus master 发起 DMA，直接读写内存中的描述符和 mbuf 数据区。
+
+  所以整体是：
+
+  CPU 通过 MMIO 写寄存器告诉网卡 ring 在哪里
+  网卡通过 DMA 直接读写内存中的 tx_ring / rx_ring / mbuf
+  网卡完成后通过中断通知 CPU
+
+  2. 寄存器定义模型
+
+  寄存器定义在 kernel/e1000_dev.h:4。
+
+  因为驱动把 MMIO 基址当成：
+
+  volatile uint32 *regs;
+
+  所以手册里的字节偏移要除以 4：
+
+  #define E1000_TDBAL (0x03800 / 4)
+  #define E1000_TDT   (0x03818 / 4)
+  #define E1000_RDBAL (0x02800 / 4)
+  #define E1000_RDT   (0x02818 / 4)
+
+  典型寄存器分三类：
+
+  TX 发送环：
+    TDBAL/TDBAH   发送描述符环基址
+    TDLEN         发送环长度
+    TDH           硬件 head
+    TDT           软件 tail
+
+  RX 接收环：
+    RDBAL/RDBAH   接收描述符环基址
+    RDLEN         接收环长度
+    RDH           硬件 head
+    RDT           软件 tail
+
+  Interrupt：
+    IMS           开启中断
+    IMC           屏蔽中断
+    ICR           读取并清除中断原因
+
+  3. 核心数据结构：两个 DMA 描述符环
+
+  驱动里有两个固定大小的 ring：
+
+  #define TX_RING_SIZE 16
+  #define RX_RING_SIZE 16
+
+  static struct tx_desc tx_ring[TX_RING_SIZE] __attribute__((aligned(16)));
+  static struct mbuf *tx_mbufs[TX_RING_SIZE];
+
+  static struct rx_desc rx_ring[RX_RING_SIZE] __attribute__((aligned(16)));
+  static struct mbuf *rx_mbufs[RX_RING_SIZE];
+
+  见 kernel/e1000.c:12。
+
+  描述符本身在 kernel/e1000_dev.h:50：
+
+  struct tx_desc {
+    uint64 addr;
+    uint16 length;
+    uint8 cmd;
+    uint8 status;
+    ...
+  };
+
+  接收描述符：
+
+  struct rx_desc {
+    uint64 addr;
+    uint16 length;
+    uint8 status;
+    uint8 errors;
+    ...
+  };
+
+  addr 是设备 DMA 要读写的报文缓冲区地址。
+
+  因为 xv6 内核使用 direct map，内核虚拟地址和物理地址相同，所以这里直接把 tx_ring、rx_ring、mbuf->head 地址交给设备使用。
+
+  4. mbuf 是驱动和协议栈之间的包对象
+
+  mbuf 在网络栈中表示一个完整报文缓冲区，分配在 kernel/net.c:55：
+
+  struct mbuf *m = kalloc();
+  m->head = m->buf + headroom;
+  m->len = 0;
+
+  发送方向：
+
+  socket / UDP / IP / Ethernet
+    -> mbufpush() 逐层压入协议头
+    -> eth_tx()
+    -> e1000_transmit()
+    -> E1000 DMA 读取 mbuf->head
+
+  eth_tx() 最后直接把 mbuf 所有权交给 E1000 驱动，见 kernel/net.c:142。
+
+  接收方向：
+
+  E1000 DMA 写入 rx_mbufs[i]->head
+    -> e1000_recv()
+    -> net_rx(m)
+    -> Ethernet 分发到 ARP 或 IP
+
+  net_rx() 见 kernel/net.c:453。
+
+  5. 初始化流程
+
+  E1000 初始化在 kernel/e1000.c:47。
+
+  主要步骤：
+
+  1. 保存 MMIO 基址：
+
+  regs = xregs;
+
+  2. 屏蔽中断并复位设备：
+
+  regs[E1000_IMC] = 0xffffffff;
+  regs[E1000_CTL] |= E1000_CTL_RST;
+
+  3. 初始化 TX ring：
+
+  for (int i = 0; i < TX_RING_SIZE; i++)
+    tx_ring[i].status = E1000_TXD_STAT_DD;
+
+  DD 表示 descriptor done。初始化为 DD，表示这些发送描述符当前都空闲，软件可以使用。
+
+  然后把 ring 地址写给设备：
+
+  regs[E1000_TDBAL] = (uint64)tx_ring;
+  regs[E1000_TDLEN] = sizeof(tx_ring);
+  regs[E1000_TDH] = 0;
+  regs[E1000_TDT] = 0;
+
+  4. 初始化 RX ring：
+
+  rx_mbufs[i] = mbufalloc(0);
+  rx_ring[i].addr = (uint64)rx_mbufs[i]->head;
+
+  接收环必须提前给每个描述符准备一个 DMA 缓冲区。否则网卡收到包时没有地方写。
+
+  5. 设置 MAC 地址：
+
+  regs[E1000_RA] = 0x12005452;
+  regs[E1000_RA + 1] = 0x80005634;
+
+  对应 QEMU 默认 MAC：
+
+  52:54:00:12:34:56
+
+  6. 启用发送、接收和中断：
+
+  regs[E1000_TCTL] = ...
+  regs[E1000_RCTL] = ...
+  regs[E1000_IMS] = E1000_INT_TXDW | E1000_INT_RXDW;
+
+  6. 发送路径
+
+  发送入口是 kernel/e1000.c:103：
+
+  int e1000_transmit(struct mbuf *m)
+
+  流程：
+
+  1. 加 e1000_lock
+  2. 读取 TDT，找到下一个 TX 描述符
+  3. 检查 DD 位
+     - DD=1：描述符空闲
+     - DD=0：硬件还没发送完，ring 满，返回 -1
+  4. 如果该槽位有旧 mbuf，释放
+  5. 填 tx_desc：
+     addr   = m->head
+     length = m->len
+     cmd    = EOP | RS
+     status = 0
+  6. tx_mbufs[index] = m
+  7. memory barrier
+  8. 更新 TDT，把描述符交给硬件
+  9. 解锁
+
+  关键代码：
+
+  int index = regs[E1000_TDT];
+  struct tx_desc *desc = &tx_ring[index];
+
+  if ((desc->status & E1000_TXD_STAT_DD) == 0)
+    return -1;
+
+  desc->addr = (uint64)m->head;
+  desc->length = m->len;
+  desc->cmd = E1000_TXD_CMD_EOP | E1000_TXD_CMD_RS;
+  desc->status = 0;
+
+  tx_mbufs[index] = m;
+  __sync_synchronize();
+  regs[E1000_TDT] = (index + 1) % TX_RING_SIZE;
+
+  EOP 表示这是一个完整包的结束。这个驱动简化为一个包只用一个描述符。
+
+  RS 表示要求硬件发送完成后回写 DD 状态位。
+
+  7. 发送完成回收
+
+  发送完成后，网卡产生 TXDW 中断。
+
+  中断处理里调用：
+
+  e1000_reclaim();
+
+  见 kernel/e1000.c:134。
+
+  它扫描 TX ring：
+
+  if (tx_mbufs[i] && (tx_ring[i].status & E1000_TXD_STAT_DD)) {
+    mbuffree(tx_mbufs[i]);
+    tx_mbufs[i] = 0;
+  }
+
+  也就是：
+
+  硬件设置 DD
+    -> 软件知道 DMA 已经不再使用这个 mbuf
+    -> 可以释放 mbuf
+
+  8. 接收路径
+
+  接收处理在 kernel/e1000.c:148。
+
+  核心规则：
+
+  RDT 指向软件最后归还给硬件的描述符
+  软件从 RDT + 1 开始看有没有新包
+
+  代码：
+
+  int index = (regs[E1000_RDT] + 1) % RX_RING_SIZE;
+  struct rx_desc *desc = &rx_ring[index];
+
+  if ((desc->status & E1000_RXD_STAT_DD) == 0)
+    return;
+
+  如果 DD=1，说明硬件已经 DMA 写入了一个包。
+
+  然后检查：
+
+  desc->status & E1000_RXD_STAT_EOP
+  desc->errors == 0
+  desc->length <= MBUF_SIZE
+
+  这个驱动要求一个完整包必须放在一个描述符中，不处理跨多个描述符的大包。
+
+  成功接收时：
+
+  1. 取出当前 rx_mbufs[index]，准备上送协议栈
+  2. 分配 replacement mbuf
+  3. 把 replacement 放回 rx_ring[index]
+  4. 清空描述符状态
+  5. 更新 RDT，把描述符还给硬件
+  6. 释放 e1000_lock
+  7. 调用 net_rx(m)
+
+  关键点：调用 net_rx(m) 前必须释放 e1000_lock。
+
+  代码注释也写了原因：
+
+  // net_rx() 可能立即发送 ARP/ICMP 应答，因此绝不能持有 e1000_lock。
+
+  见 kernel/e1000.c:194。
+
+  否则可能出现：
+
+  e1000_recv() 持有 e1000_lock
+    -> net_rx()
+      -> arp_rx / icmp_rx
+        -> eth_tx()
+          -> e1000_transmit()
+            -> 再次 acquire e1000_lock
+
+  这会自锁死。
+
+  9. 中断模型
+
+  E1000 使用 PLIC 外部中断，IRQ 是：
+
+  #define E1000_IRQ 33
+
+  见 kernel/memlayout.h:34。
+
+  中断分发在 kernel/trap.c:191：
+
+  int irq = plic_claim();
+
+  if (irq == E1000_IRQ) {
+    e1000_intr();
+  }
+
+  plic_complete(irq);
+
+  e1000_intr() 读取 ICR：
+
+  uint32 cause = regs[E1000_ICR];
+
+  ICR 是 read-clear 寄存器，读出来同时清除中断原因。
+
+  然后：
+
+  if (cause & E1000_INT_TXDW)
+    e1000_reclaim();
+
+  if (cause & E1000_INT_RXDW)
+    e1000_recv();
+
+  见 kernel/e1000.c:201。
+
+  10. 所有权模型
+
+  这个驱动最重要的是 mbuf 所有权。
+
+  发送：
+
+  协议栈持有 mbuf
+    -> e1000_transmit(m) 成功
+    -> mbuf 所有权交给驱动/硬件
+    -> 硬件 DMA 读取
+    -> 硬件置 DD
+    -> e1000_reclaim() 释放 mbuf
+
+  如果 e1000_transmit() 返回 -1，说明发送 ring 满，调用者仍然持有 mbuf，需要自己处理或释放。
+
+  接收：
+
+  驱动预先持有 rx_mbufs[i]
+    -> 硬件 DMA 写入 rx_mbufs[i]
+    -> e1000_recv() 取出该 mbuf
+    -> 分配 replacement 补回 ring
+    -> 原 mbuf 交给 net_rx()
+    -> 协议栈最终消费或释放
+
+  11. 锁模型
+
+  只有一把：
+
+  static struct spinlock e1000_lock;
+
+  保护：
+
+  tx_ring
+  tx_mbufs
+  rx_ring
+  rx_mbufs
+  TDT/RDT 操作
+
+  但驱动刻意不在持锁状态下调用协议栈：
+
+  release(&e1000_lock);
+  if (deliver)
+    net_rx(m);
+
+  这是为了避免协议栈反向调用发送路径造成死锁。
+
+  12. 这个驱动的简化点
+
+  这个 E1000 驱动是教学型实现，做了很多简化：
+
+  1. TX/RX ring 只有 16 个描述符。
+  2. 一个包只使用一个描述符，不支持 scatter-gather。
+  3. RX 不处理跨多个描述符的大包。
+  4. 不使用 checksum offload。
+  5. 不实现 NAPI/polling。
+  6. 不做复杂 PCI 资源分配，只固定配置 BAR0。
+  7. 不支持 MSI/MSI-X，只走 PLIC legacy interrupt。
+  8. TX ring 满时直接返回 -1，不阻塞等待。
+
+  一句话总结：这个 E1000 驱动是一个 MMIO 控制 + DMA ring 收发 + PLIC 中断通知 + mbuf 所有权转移 的模型。CPU 不搬运大块网络数据，只负责设置描述符、推进 tail、处理中断；真正的报文
+  数据移动由 E1000 设备通过 DMA 完成。
+
+─ Worked for 1m 30s ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+› 说说  TX 发送环：和RX接收环：的tail和head、软件和硬件是如何配合的？
+
+
+• E1000 的 TX/RX 都是“环形队列”，但 TX 和 RX 的 head/tail 语义方向不完全一样。可以先记住一句话：
+
+  TX：软件生产描述符，硬件消费描述符。
+  RX：硬件生产描述符，软件消费描述符。
+
+  ———
+
+  TX 发送环
+
+  TX ring 是发送队列：
+
+  软件把要发送的包放进描述符
+  硬件从描述符里 DMA 读取包并发送出去
+
+  寄存器：
+
+  TDH = Transmit Descriptor Head  硬件消费位置
+  TDT = Transmit Descriptor Tail  软件生产位置
+
+  在 xv6 里，软件主要操作 TDT：
+
+  int index = regs[E1000_TDT];
+  struct tx_desc *desc = &tx_ring[index];
+
+  见 kernel/e1000.c:106。
+
+  发送前检查这个描述符是否空闲：
+
+  if ((desc->status & E1000_TXD_STAT_DD) == 0)
+    return -1;
+
+  DD = Descriptor Done。
+
+  含义：
+
+  DD = 1  硬件已经处理完这个描述符，软件可以重用
+  DD = 0  描述符还属于硬件，软件不能覆盖
+
+  发送流程：
+
+  TX ring 初始：
+    所有 desc.status = DD
+    TDH = 0
+    TDT = 0
+
+  软件发送一个包：
+    1. 读取 TDT，得到 index
+    2. 检查 tx_ring[index].DD 是否为 1
+    3. 填 desc.addr / desc.length / desc.cmd
+    4. 清 desc.status = 0
+    5. tx_mbufs[index] = m
+    6. TDT = index + 1
+       这一步把描述符交给硬件
+
+  硬件看到 TDT 推进：
+    1. 从 TDH 开始消费描述符
+    2. DMA 读取 desc.addr 指向的包数据
+    3. 发送到网卡
+    4. 发送完成后写回 desc.status.DD = 1
+    5. 推进 TDH
+    6. 触发 TXDW 中断
+
+  可以画成：
+
+  TX ring：软件生产，硬件消费
+
+          软件填这里
+             |
+             v
+  +----+----+----+----+----+
+  | D0 | D1 | D2 | D3 | D4 |
+  +----+----+----+----+----+
+         ^         ^
+         |         |
+        TDH       TDT
+
+  TDH -> 硬件下一次要处理的位置
+  TDT -> 软件下一次要填的位置
+
+  但 xv6 驱动不直接依赖 TDH 判断空闲，而是依赖描述符里的 DD 位。
+
+  核心代码：
+
+  desc->addr = (uint64)m->head;
+  desc->length = m->len;
+  desc->cmd = E1000_TXD_CMD_EOP | E1000_TXD_CMD_RS;
+  desc->status = 0;
+  tx_mbufs[index] = m;
+  __sync_synchronize();
+  regs[E1000_TDT] = (index + 1) % TX_RING_SIZE;
+
+  见 kernel/e1000.c:117。
+
+  注意顺序：
+
+  先填描述符
+  再 memory barrier
+  最后更新 TDT
+
+  因为 TDT 一更新，硬件就可能立刻读取描述符。
+
+  ———
+
+  RX 接收环
+
+  RX ring 是接收队列：
+
+  软件提前给硬件准备空 buffer
+  硬件收到包后 DMA 写入 buffer
+  软件再取走已经写好的包
+
+  寄存器：
+
+  RDH = Receive Descriptor Head  硬件生产位置
+  RDT = Receive Descriptor Tail  软件归还位置
+
+  RX 和 TX 最容易混淆。RX 里软件不是“填待发送包”，而是补充空 buffer 给硬件。
+
+  初始化时：
+
+  for (int i = 0; i < RX_RING_SIZE; i++) {
+    rx_mbufs[i] = mbufalloc(0);
+    rx_ring[i].addr = (uint64)rx_mbufs[i]->head;
+  }
+  regs[E1000_RDH] = 0;
+  regs[E1000_RDT] = RX_RING_SIZE - 1;
+
+  见 kernel/e1000.c:70。
+
+  为什么 RDT = RX_RING_SIZE - 1？
+
+  因为 E1000 的接收规则是：
+
+  硬件可以使用 RDH 到 RDT 之间的描述符
+  RDT 表示软件已经准备好的最后一个描述符
+
+  初始化时设成最后一个，表示整个 ring 都可供硬件使用。
+
+  收到包后：
+
+  硬件：
+    1. 找一个可用 RX 描述符
+    2. DMA 把包写到 desc.addr 指向的 mbuf
+    3. 写 desc.length
+    4. 设置 desc.status.DD = 1
+    5. 如果一个完整包结束，设置 EOP
+    6. 推进 RDH
+    7. 触发 RXDW 中断
+
+  软件中断里处理：
+
+  int index = (regs[E1000_RDT] + 1) % RX_RING_SIZE;
+  struct rx_desc *desc = &rx_ring[index];
+
+  if ((desc->status & E1000_RXD_STAT_DD) == 0)
+    return;
+
+  见 kernel/e1000.c:152。
+
+  为什么软件看 RDT + 1？
+
+  因为 RDT 是“软件最后归还给硬件的位置”。如果硬件已经填好了下一个描述符，那么软件就从 RDT + 1 开始取。
+
+  软件消费一个包后：
+
+  1. 取出 rx_mbufs[index] 作为收到的包
+  2. 分配 replacement mbuf
+  3. 把 replacement->head 写回 desc.addr
+  4. 清 desc.status
+  5. RDT = index
+     这表示这个描述符重新归还给硬件
+  6. 把原 mbuf 交给 net_rx()
+
+  核心代码：
+
+  struct mbuf *m = rx_mbufs[index];
+  replacement = mbufalloc(0);
+
+  m->len = desc->length;
+  rx_mbufs[index] = replacement;
+  desc->addr = (uint64)replacement->head;
+
+  desc->status = 0;
+  __sync_synchronize();
+  regs[E1000_RDT] = index;
+
+  见 kernel/e1000.c:161。
+
+  可以画成：
+
+  RX ring：硬件生产，软件消费
+
+         软件准备好的最后一个
+                |
+                v
+  +----+----+----+----+----+
+  | D0 | D1 | D2 | D3 | D4 |
+  +----+----+----+----+----+
+         ^         ^
+         |         |
+        RDH       RDT
+
+  RDH -> 硬件下一次可能写入的位置
+  RDT -> 软件最后归还给硬件的位置
+
+  软件实际消费的是：
+
+  (RDT + 1) % RX_RING_SIZE
+
+  如果这个位置 DD=1，说明硬件已经写好了包。
+
+  ———
+
+  TX/RX 对比
+
+  TX:
+    软件填描述符
+    软件推进 TDT
+    硬件读取描述符和包
+    硬件设置 DD
+    硬件推进 TDH
+
+  RX:
+    软件预先放空 buffer
+    软件推进 RDT 表示归还 buffer
+    硬件写入包
+    硬件设置 DD
+    硬件推进 RDH
+    软件从 RDT+1 取包
+
+  更紧凑地说：
+
+  TX 的 tail 是“软件通知硬件：我又放了一个待发送包”
+  RX 的 tail 是“软件通知硬件：我又还了一个空接收 buffer”
+
+  为什么两边都要 DD 位
+
+  因为 head/tail 是设备寄存器，软件读它们不一定是最方便或最可靠的同步方式。描述符里的 DD 是硬件对单个描述符的完成确认。
+
+  在 xv6 里：
+
+  TX:
+    软件检查 DD=1 才能重用该 TX 描述符
+
+  RX:
+    软件检查 DD=1 才知道该 RX 描述符里有新包
+
+  这个驱动里的所有权变化
+
+  TX：
+
+  软件/协议栈 owns mbuf
+    -> e1000_transmit 成功
+    -> 驱动/硬件 owns mbuf
+    -> 硬件设置 DD
+    -> e1000_reclaim 释放 mbuf
+
+  RX：
+
+  驱动 owns 空 mbuf
+    -> 硬件 DMA 写入
+    -> DD=1
+    -> 驱动取出 mbuf
+    -> 补 replacement 给硬件
+    -> 原 mbuf 交给 net_rx()
+
+  所以 head/tail 的配合，本质上是在维护这件事：
+
+  哪些描述符属于软件
+  哪些描述符属于硬件
+  哪些 mbuf 可以释放
+  哪些 mbuf 必须保留给 DMA 使用
+

@@ -48,6 +48,7 @@ kvmmake(void)
   kvmmap(kpgtbl, KERNBASE, KERNBASE, (uint64)etext - KERNBASE, PTE_R | PTE_X);
 
   // map kernel data and the physical RAM we'll make use of.
+  // 剩余物理地址（包括内核 data段）全部映射到内核页表，所以内核随意读写这些地址 并不会触发  page fault 
   kvmmap(kpgtbl, (uint64)etext, (uint64)etext, PHYSTOP - (uint64)etext,
          PTE_R | PTE_W);
 

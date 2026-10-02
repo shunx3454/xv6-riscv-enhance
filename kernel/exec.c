@@ -70,6 +70,7 @@ kexec(char *path, char **argv)
       goto bad;
     if (ph.vaddr % PGSIZE != 0)
       goto bad;
+
     uint64 sz1;
     if ((sz1 = uvmalloc(pagetable, sz, ph.vaddr + ph.memsz,
                         flags2perm(ph.flags))) == 0)
@@ -139,6 +140,7 @@ kexec(char *path, char **argv)
   p->sz = sz;
   p->trapframe->epc = elf.entry; // initial program counter = ulib.c:start()
   p->trapframe->sp = sp;         // initial stack pointer
+  // 释放mmap映射
   vma_unmap_all_from(oldpagetable, p->vmas, 1);
   proc_freepagetable(oldpagetable, oldsz);
 
